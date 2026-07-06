@@ -126,7 +126,7 @@ try:
     #profit.count()
 except Exception as e:
     log_error(str(e), f"Error while reading the data profit ")
--------------- WRITE INTO REDHSIFT
+-------------- WRITE INTO REDHSIFT USING DYNAMIC FRAME
 try:
     # Convert the transformed data frame to a dynamic frame for glue compatibility
     dynamicFrame = DynamicFrame.fromDF(finaldf, glueContext, "dynamicFrame")
@@ -147,6 +147,16 @@ try:
     print("Data Successfully Written to Redshift Table factaccountsnapshot_final !")
 except Exception as e:
     log_error(str(e), "Error while writing the data") 
+	
+----------- JDBC WAY OF WRITING INTO REDSHIFT
+    # dynamicFrame1.write \
+    #     .format("jdbc") \
+    #     .option("url", secret['url_intg']) \
+    #     .option("dbtable", "l2_reporting_sch.customertable") \
+    #     .option("user", secret['username']) \
+    #     .option("password", secret['password']) \
+    #     .mode("append") \
+    #     .save()
 ------------ JVM WAY OF UPDATE STATEMENTS
 def execute_redshift_query(query: str, conn_options: dict):
     jvm = spark._jvm
