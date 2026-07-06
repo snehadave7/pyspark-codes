@@ -1,0 +1,399 @@
+Input format
+{
+  "source": "aws.s3",
+  "detail-type": "Object Created",
+  "detail": {
+    "bucket": {
+      "name": "paymatix-aws-bucket"
+    },
+    "object": {
+      "key": "Saas-data/uploads/Raw_loading/1778002319470819/20241201/RAW_DAILY_FRAUD_ANALYSIS_VISA_20241201_BANK75.csv"
+    }
+  },
+  "extracted": {
+    "subscription_id": "1778002319470819",
+    "BucketName": "paymatix-aws-bucket",
+    "filename": "RAW_DAILY_FRAUD_ANALYSIS_VISA_20241201_BANK75",
+    "ObjectKey": "Saas-data/uploads/Raw_loading/1778002319470819/20241201/RAW_DAILY_FRAUD_ANALYSIS_VISA_20241201_BANK75.csv",
+    "raw_records_check": "DAILY"
+  }
+}
+
+Code sample
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "Check Executions",
+  "States": {
+    "Check Executions": {
+      "Type": "Task",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:626127144746:stateMachine:INTG_DataValidation_POC_SaaS",
+        "StatusFilter": "RUNNING"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:sfn:listExecutions",
+      "Next": "Executions = 1",
+      "ResultSelector": {
+        "runningExecutionsCount.$": "States.ArrayLength($.Executions)",
+        "firstExecution.$": "$.Executions[-1:]"
+      },
+      "ResultPath": "$.TaskResult"
+    },
+    "Executions = 1": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.TaskResult.firstExecution[0].Name",
+              "StringEqualsPath": "$$.Execution.Name"
+            }
+          ],
+          "Next": "ExtractBucketAndKey"
+        }
+      ],
+      "Default": "Wait for Completion"
+    },
+    "Wait for Completion": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "Check Executions"
+    },
+    "ExtractBucketAndKey": {
+      "Type": "Pass",
+      "Parameters": {
+        "BucketName.$": "$.detail.bucket.name",
+        "ObjectKey.$": "$.detail.object.key",
+        "filename.$": "States.ArrayGetItem(States.StringSplit(States.ArrayGetItem(States.StringSplit($.detail.object.key, '/'), States.MathAdd(States.ArrayLength(States.StringSplit($.detail.object.key, '/')), -1)), '.'), 0)"
+      },
+      "ResultPath": "$.extracted",
+      "Next": "ConstructSql"
+    },
+    "ConstructSql": {
+      "Type": "Pass",
+      "ResultPath": "$.sql",
+      "Result": {
+        "Sql": "select * from lkp_sch.raw_loading_file_logs where UPPER(filename)=UPPER('{}');"
+      },
+      "Next": "ExecuteSelectStatement"
+    },
+    "ExecuteSelectStatement": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+      "Parameters": {
+        "ClusterIdentifier": "ptx-integration-db",
+        "Database": "ptx_dwh_db_saas",
+        "DbUser": "gk",
+        "Sql.$": "States.Format($.sql.Sql, $.extracted.filename)"
+      },
+      "ResultPath": "$.queryResult",
+      "Next": "DescribeStatement"
+    },
+    "DescribeStatement": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+      "Parameters": {
+        "Id.$": "$.queryResult.Id"
+      },
+      "ResultPath": "$.queryResult",
+      "Next": "CheckStatus"
+    },
+    "CheckStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.queryResult.Status",
+          "StringEquals": "FINISHED",
+          "Next": "GetStatementResult"
+        },
+        {
+          "Variable": "$.queryResult.Status",
+          "StringEquals": "FAILED",
+          "Next": "FailState"
+        }
+      ],
+      "Default": "WaitState"
+    },
+    "WaitState": {
+      "Type": "Wait",
+      "Seconds": 5,
+      "Next": "DescribeStatement"
+    },
+    "GetStatementResult": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:getStatementResult",
+      "Parameters": {
+        "Id.$": "$.queryResult.Id"
+      },
+      "ResultPath": "$.queryResult",
+      "Next": "CheckValidFile"
+    },
+    "CheckValidFile": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.queryResult.TotalNumRows",
+          "NumericEquals": 0,
+          "Next": "FailState"
+        }
+      ],
+      "Default": "Check Glue Jobs"
+    },
+    "Check Glue Jobs": {
+      "Type": "Task",
+      "Parameters": {
+        "JobName": "INTG_FILE_PRE_CHECKS_SAAS",
+        "MaxResults": 1
+      },
+      "Resource": "arn:aws:states:::aws-sdk:glue:getJobRuns",
+      "Next": "Glue Job Running?",
+      "ResultPath": "$.glueJobStatus"
+    },
+    "Glue Job Running?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.glueJobStatus.JobRuns",
+          "IsPresent": true,
+          "Next": "Check Job Runs Length"
+        }
+      ],
+      "Default": "WaitAddedForConcurrentJobRun"
+    },
+    "Check Job Runs Length": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.glueJobStatus.JobRuns[0]",
+          "IsPresent": true,
+          "Next": "Check Job Run State"
+        }
+      ],
+      "Default": "WaitAddedForConcurrentJobRun"
+    },
+    "Check Job Run State": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.glueJobStatus.JobRuns[0].JobRunState",
+          "StringEquals": "RUNNING",
+          "Next": "Wait for Glue Job Completion"
+        }
+      ],
+      "Default": "WaitAddedForConcurrentJobRun"
+    },
+    "Wait for Glue Job Completion": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "Check Glue Jobs"
+    },
+    "WaitAddedForConcurrentJobRun": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "Glue StartJobRun"
+    },
+    "Glue StartJobRun": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun",
+      "Parameters": {
+        "JobName": "INTG_FILE_PRE_CHECKS_SAAS",
+        "Arguments": {
+          "--encryption-type": "sse-s3",
+          "--Bucket.$": "$.extracted.BucketName",
+          "--Prefix.$": "$.extracted.ObjectKey"
+        }
+      },
+      "ResultPath": "$.JobRunDetails",
+      "Next": "GetJobRun"
+    },
+    "GetJobRun": {
+      "Type": "Task",
+      "Parameters": {
+        "JobName": "INTG_FILE_PRE_CHECKS_SAAS",
+        "RunId.$": "$.JobRunDetails.JobRunId"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:glue:getJobRun",
+      "ResultPath": "$.ProfileJobDetails",
+      "Next": "EvaluateJobStatus"
+    },
+    "EvaluateJobStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.ProfileJobDetails.JobRun.JobRunState",
+          "StringEquals": "SUCCEEDED",
+          "Next": "GetS3Object"
+        },
+        {
+          "Variable": "$.ProfileJobDetails.JobRun.JobRunState",
+          "StringEquals": "FAILED",
+          "Next": "FailState"
+        },
+        {
+          "Variable": "$.ProfileJobDetails.JobRun.JobRunState",
+          "StringEquals": "RUNNING",
+          "Next": "WaitStateForGlueJob"
+        }
+      ]
+    },
+    "FailState": {
+      "Type": "Fail",
+      "Error": "QueryFailed",
+      "Cause": "Glue Job execution failed."
+    },
+    "WaitStateForGlueJob": {
+      "Type": "Wait",
+      "Seconds": 2,
+      "Next": "GetJobRun"
+    },
+    "GetS3Object": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Parameters": {
+        "Bucket.$": "$.extracted.BucketName",
+        "Key": "databrew-temp/validationResult.json"
+      },
+      "ResultPath": "$.MetaData",
+      "Next": "ParseJson"
+    },
+    "ParseJson": {
+      "Type": "Pass",
+      "Parameters": {
+        "path.$": "States.StringToJson($.MetaData.Body)"
+      },
+      "ResultPath": "$.parsedJson",
+      "Next": "CheckRule1Status"
+    },
+    "CheckRule1Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.parsedJson.path.rowCount",
+          "StringEquals": "0",
+          "Next": "RecordCheck1ResultFailed"
+        }
+      ],
+      "Default": "RecordCheck1ResultPassed"
+    },
+    "RecordCheck1ResultFailed": {
+      "Type": "Pass",
+      "Result": {
+        "Check1": "Failed"
+      },
+      "ResultPath": "$.checkResults1",
+      "Next": "CheckRule2Status"
+    },
+    "RecordCheck1ResultPassed": {
+      "Type": "Pass",
+      "Result": {
+        "Check1": "Passed"
+      },
+      "ResultPath": "$.checkResults1",
+      "Next": "CheckRule2Status"
+    },
+    "CheckRule2Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.parsedJson.path.duplicate",
+          "StringEquals": "0",
+          "Next": "RecordCheck2ResultPassed"
+        }
+      ],
+      "Default": "RecordCheck2ResultFailed"
+    },
+    "RecordCheck2ResultFailed": {
+      "Type": "Pass",
+      "Result": {
+        "Check2": "Failed"
+      },
+      "ResultPath": "$.checkResults2",
+      "Next": "CheckRule3Status"
+    },
+    "RecordCheck2ResultPassed": {
+      "Type": "Pass",
+      "Result": {
+        "Check2": "Passed"
+      },
+      "ResultPath": "$.checkResults2",
+      "Next": "CheckRule3Status"
+    },
+    "CheckRule3Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.parsedJson.path.schema",
+          "StringEquals": "1",
+          "Next": "RecordCheck3ResultPassed"
+        }
+      ],
+      "Default": "RecordCheck3ResultFailed"
+    },
+    "RecordCheck3ResultFailed": {
+      "Type": "Pass",
+      "Result": {
+        "Check3": "Failed"
+      },
+      "ResultPath": "$.checkResults3",
+      "Next": "DeleteS3Object"
+    },
+    "RecordCheck3ResultPassed": {
+      "Type": "Pass",
+      "Result": {
+        "Check3": "Passed"
+      },
+      "ResultPath": "$.checkResults3",
+      "Next": "DeleteS3Object"
+    },
+    "DeleteS3Object": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+      "Parameters": {
+        "Bucket.$": "$.extracted.BucketName",
+        "Key": "databrew-temp/validationResult.json"
+      },
+      "ResultPath": "$.DeleteObjectResult",
+      "Next": "ConstructSql2"
+    },
+    "ConstructSql2": {
+      "Type": "Pass",
+      "ResultPath": "$.sql",
+      "Result": {
+        "Sql": "update lkp_sch.raw_loading_file_logs set schema_check={},duplicate_check={},rowcount_check={} where UPPER(filename)=UPPER('{}')"
+      },
+      "Next": "ExecuteUpdateStatement"
+    },
+    "ExecuteUpdateStatement": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+      "Parameters": {
+        "ClusterIdentifier": "ptx-integration-db",
+        "Database": "ptx_dwh_db_saas",
+        "DbUser": "gk",
+        "Sql.$": "States.Format($.sql.Sql, $.parsedJson.path.schema, $.parsedJson.path.duplicate, $.parsedJson.path.rowCount, $.extracted.filename)"
+      },
+      "ResultPath": "$.queryResult",
+      "Next": "DescribeStatement2"
+    },
+    "DescribeStatement2": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+      "Parameters": {
+        "Id.$": "$.queryResult.Id"
+      },
+      "ResultPath": "$.queryResult",
+      "Next": "FinalResult"
+    },
+    "FinalResult": {
+      "Type": "Pass",
+      "ResultPath": "$.finalResult",
+      "Parameters": {
+        "Summary": {
+          "RowCountValidation.$": "$.checkResults1.Check1",
+          "DuplicateRowValidation.$": "$.checkResults2.Check2",
+          "SchemaValidation.$": "$.checkResults3.Check3"
+        }
+      },
+      "End": true
+    }
+  }
+}
