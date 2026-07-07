@@ -170,3 +170,33 @@ try:
     execute_redshift_query(update_query23, myConnOptions) 
 except Exception as e:
     log_error(str(e), f"Error while executing the update_query")
+
+
+def write_to_redshift_jdbc(df, table_name, secret):
+    try:
+        # 1. Dynamic Partitioning based on row count
+        # 1-20k: 1 connection | 20k-50k: 3 connections | 50k+: 5 connections
+        row_count = df.count()
+        num_partitions = 1 if row_count < 20000 else (3 if row_count < 50000 else 5)
+        # 2. Advanced JDBC URL with "Anti-Lock" parameters
+        # reWriteBatchedInserts: Essential for speed
+        # loginTimeout: Kills the attempt if Redshift is too busy (prevents hanging)
+        # tcpKeepAlive: Ensures the connection doesn't drop during long writes
+        base_url = secret['url_intg']
+        params = "reWriteBatchedInserts=true&tcpKeepAlive=true&loginTimeout=120&connectTimeout=120"
+        jdbc_url = f"{base_url}&{params}" if "?" in base_url else f"{base_url}?{params}"
+ 
+        print(f"Writing {row_count} rows to {table_name} using {num_partitions} partitions...")
+ 
+        # 3. The Write Operation
+        df.repartition(num_partitions).write \
+            .format("jdbc") \
+            .option("url", jdbc_url) \
+            .option("dbtable", table_name) \
+            .option("user", secret['username']) \
+            .option("password", secret['password']) \
+            .option("batchsize", "25000") \
+            .option("rewriteBatchedStatements", "true") \
+            .mode("append") \
+            .save()
+        print(f"Successfully loaded {table_name}")
